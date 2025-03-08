@@ -1,0 +1,253 @@
+#ifndef LEARNING_H
+#define LEARNING_H
+
+#include <vector>
+#include <random>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <algorithm>
+#include <numeric>
+#include <cmath>
+#include <map>
+
+class LearningState {
+public:
+    struct ParamRange {
+        float min, max, center, influence; // Основные параметры
+        std::vector<float> successful_values; // Успешные значения
+        std::vector<std::pair<float, float>> history; // История: значение, score
+        std::vector<float> grad_history; // История градиентов
+        float momentum, velocity, grad_norm; // Моменты и нормализация
+        float long_term_trend, short_term_trend; // Тренды
+        int stagnation_counter, success_counter; // Счетчики
+        float min_init, max_init; // Исходные границы
+        float adaptive_step, exploration_boost; // Шаг и усиление исследования
+        float psnr_weight, size_weight; // Адаптивные веса метрики
+        std::map<float, float> value_score_map; // Карта значений и их скор
+        static constexpr float beta1 = 0.8f; // Быстрый момент
+        static constexpr float beta2 = 0.95f; // Чувствительная скорость
+        static constexpr float beta3 = 0.5f; // Краткосрочный тренд
+        static constexpr float epsilon = 1e-5f; // Высокая точность
+
+        ParamRange(float m, float M) : min(m), max(M), center((m + M) / 2), influence(0.0f),
+                                       momentum(0.0f), velocity(0.0f), grad_norm(0.0f),
+                                       long_term_trend(0.0f), short_term_trend(0.0f),
+                                       stagnation_counter(0), success_counter(0),
+                                       min_init(m), max_init(M), adaptive_step(0.25f),
+                                       exploration_boost(1.0f), psnr_weight(0.5f), size_weight(0.4f) {
+            history.reserve(50); // Большая история
+            grad_history.reserve(50);
+        }
+
+        // Самообучающаяся метрика
+        float compute_score(float psnr, float base_psnr, float size_ratio) {
+            // Анализ корреляции на основе истории
+            if (history.size() >= 10) {
+                float psnr_corr = 0.0f, size_corr = 0.0f, sum_score = 0.0f;
+                for (const auto& [val, sc] : history) {
+                    psnr_corr += sc * (psnr - base_psnr);
+                    size_corr += sc * size_ratio;
+                    sum_score += sc;
+                }
+                psnr_corr /= sum_score + epsilon;
+                size_corr /= sum_score + epsilon;
+                float total_corr = std::abs(psnr_corr) + std::abs(size_corr);
+                if (total_corr > 0.01f) {
+                    psnr_weight = 0.9f * psnr_weight + 0.1f * (std::abs(psnr_corr) / total_corr);
+                    size_weight = 0.9f * size_weight + 0.1f * (std::abs(size_corr) / total_corr);
+                }
+            }
+
+            float psnr_gain = std::tanh((psnr - base_psnr) / 2.5f) * 3.0f; // Гиперчувствительность
+            float compression_gain = std::log1p(size_ratio * 2.5f) * 2.0f; // Максимальный вклад сжатия
+            float stability = history.empty() ? 0.0f :
+                              -std::abs(center - std::accumulate(history.begin(), history.end(), 0.0f,
+                                                                 [](float a, const auto& p) { return a + p.first; }) / history.size()) / (max - min) * 0.2f;
+            float progress = short_term_trend > 0.0f ? std::log1p(short_term_trend * 2.0f) : short_term_trend;
+            return psnr_gain * psnr_weight + compression_gain * size_weight + stability * 0.05f + progress * 0.05f;
+        }
+
+        // Нейро-подобное обновление с моментом Нестерова
+        void update(float value, float psnr, float base_psnr, float size_ratio = 1.0f) {
+            float score = compute_score(psnr, base_psnr, size_ratio);
+            history.emplace_back(value, score);
+            if (history.size() > 50) history.erase(history.begin());
+            value_score_map[value] = score; // Обновляем карту
+
+            // Градиент с нормализацией второго порядка
+            float raw_grad = score - influence;
+            grad_history.push_back(raw_grad);
+            if (grad_history.size() > 50) grad_history.erase(grad_history.begin());
+            grad_norm = beta2 * grad_norm + (1.0f - beta2) * raw_grad * raw_grad;
+            float normalized_grad = raw_grad / (std::sqrt(grad_norm) + epsilon) * (score > 0.5f ? 2.5f : 1.0f);
+
+            // Момент Нестерова
+            float lookahead_momentum = momentum + (1.0f - beta1) * normalized_grad;
+            momentum = beta1 * momentum + (1.0f - beta1) * normalized_grad;
+            velocity = beta2 * velocity + (1.0f - beta2) * normalized_grad * normalized_grad;
+            float momentum_hat = lookahead_momentum / (1.0f - std::pow(beta1, history.size() + 1));
+            float velocity_hat = velocity / (1.0f - std::pow(beta2, history.size() + 1));
+
+            // Адаптивный шаг с предсказанием
+            if (score > 1.5f) adaptive_step = std::min(0.5f, adaptive_step + 0.05f); // Турбо-ускорение
+            else if (score < -1.5f) adaptive_step = std::max(0.03f, adaptive_step - 0.02f); // Осторожность
+            float step = adaptive_step * momentum_hat / (std::sqrt(velocity_hat) + epsilon);
+            influence += step;
+
+            // Обновление трендов
+            long_term_trend = 0.8f * long_term_trend + 0.2f * score; // Быстрый долгосрочный
+            short_term_trend = beta3 * short_term_trend + (1.0f - beta3) * score; // Очень быстрый краткосрочный
+
+            // Успешные значения с прогнозом
+            bool is_success = psnr >= 34.0f || (psnr >= 32.0f && size_ratio > 3.0f) || (psnr >= 30.0f && size_ratio > 4.0f);
+            if (is_success) {
+                successful_values.push_back(value);
+                if (successful_values.size() > 30) successful_values.erase(successful_values.begin());
+                success_counter++;
+                stagnation_counter = std::max(0, stagnation_counter - 10); // Мощный сброс
+                exploration_boost = std::max(0.3f, exploration_boost - 0.15f);
+            } else {
+                stagnation_counter++;
+                if (success_counter > 0) success_counter--;
+            }
+
+            // Прогнозирование центра
+            float success_mean = successful_values.empty() ? center :
+                                 std::accumulate(successful_values.begin(), successful_values.end(), 0.0f) / successful_values.size();
+            float predicted_center = success_mean + momentum * (max - min) * 0.5f; // Экстраполяция
+            center = std::clamp(0.6f * center + 0.3f * success_mean + 0.1f * predicted_center + step * (max - min) * 0.5f, min, max);
+            float width = max - min;
+
+            // Эволюционное управление диапазоном
+            if (influence > 5.0f && long_term_trend > 2.5f) { // Элитное сужение
+                min = std::max(min, center - width * 0.15f);
+                max = std::min(max, center + width * 0.15f);
+                exploration_boost = std::max(0.2f, exploration_boost - 0.25f);
+            } else if (influence > 2.0f && short_term_trend > 1.0f) { // Успешное сужение
+                min = std::max(min, center - width * 0.3f);
+                max = std::min(max, center + width * 0.3f);
+            } else if (influence < -5.0f || stagnation_counter > 10) { // Эволюционный перезапуск
+                float expansion = width * (0.5f + 0.25f * std::abs(long_term_trend));
+                min = std::max(min - expansion, min_init);
+                max = std::min(max + expansion, max_init);
+                if (stagnation_counter > 25 && !successful_values.empty()) { // Генетическая встряска
+                    std::sort(successful_values.begin(), successful_values.end());
+                    float parent1 = successful_values[successful_values.size() / 2]; // Медиана
+                    float parent2 = successful_values.back(); // Лучший
+                    center = (parent1 + parent2) / 2 + (rand() % 100 - 50) * (max - min) / 500.0f; // Кроссовер + мутация
+                    influence = std::min(0.0f, influence * 0.1f);
+                    momentum = velocity = grad_norm = 0.0f;
+                    adaptive_step = 0.3f;
+                    exploration_boost = 2.5f; // Турбо-исследование
+                }
+                stagnation_counter = 0;
+            }
+
+            min = std::max(min, min_init);
+            max = std::min(max, max_init);
+        }
+
+        // Байесовская супер-выборка
+        float sample(std::mt19937& gen) const {
+            std::uniform_real_distribution<float> explore(0.0f, 1.0f);
+            float explore_prob = std::clamp(1.0f - influence / 8.0f, 0.2f, 0.8f) * exploration_boost;
+
+            if (value_score_map.empty() || explore(gen) < explore_prob) {
+                std::normal_distribution<float> dist(center, (max - min) * 0.3f);
+                return std::clamp(dist(gen), min, max);
+            }
+
+            // Байесовская оценка: выбираем значения с учетом их скор
+            float total_score = 0.0f;
+            for (const auto& [val, sc] : value_score_map) total_score += std::exp(sc);
+            float r = explore(gen) * total_score;
+            float cumulative = 0.0f;
+            float selected_val = center;
+            for (const auto& [val, sc] : value_score_map) {
+                cumulative += std::exp(sc);
+                if (cumulative >= r) {
+                    selected_val = val;
+                    break;
+                }
+            }
+
+            // Прогнозирование с мутацией
+            float predicted = selected_val + momentum * (max - min) * 0.3f;
+            std::normal_distribution<float> noise(predicted, (max - min) * std::max(0.05f, 0.2f / (1.0f + success_counter)));
+            float sampled = std::clamp(noise(gen), min, max);
+
+            float influence_weight = std::min(1.0f, influence / 6.0f);
+            sampled = (1.0f - influence_weight) * sampled + influence_weight * center;
+            return std::clamp(sampled, min, max);
+        }
+    };
+
+    ParamRange threshold{8.0f, 192.0f};
+    ParamRange filter_size{0.0f, 7.0f};
+    ParamRange edge_factor{0.0f, 3.0f};
+    ParamRange quant_factor{1.0f, 5.0f};
+    ParamRange entropy_weight{0.0f, 0.5f};
+    ParamRange texture_factor{0.5f, 2.0f};
+    ParamRange freq_factor{0.5f, 2.0f};
+    ParamRange local_entropy_factor{0.5f, 2.0f};
+    ParamRange noise_reduction{0.0f, 1.0f};
+    ParamRange contrast_boost{0.5f, 2.0f};
+    ParamRange detail_preservation{0.5f, 2.0f};
+
+    void save() const {
+        std::ofstream file("learning_state.txt");
+        if (file.is_open()) {
+            auto write_range = [&](const std::string& name, const ParamRange& r) {
+                file << name << " " << r.min << " " << r.max << " " << r.influence << " ";
+                for (float v : r.successful_values) file << v << " ";
+                file << "\n";
+            };
+            write_range("threshold", threshold);
+            write_range("filter_size", filter_size);
+            write_range("edge_factor", edge_factor);
+            write_range("quant_factor", quant_factor);
+            write_range("entropy_weight", entropy_weight);
+            write_range("texture_factor", texture_factor);
+            write_range("freq_factor", freq_factor);
+            write_range("local_entropy_factor", local_entropy_factor);
+            write_range("noise_reduction", noise_reduction);
+            write_range("contrast_boost", contrast_boost);
+            write_range("detail_preservation", detail_preservation);
+            file.close();
+        }
+    }
+
+    void load() {
+        std::ifstream file("learning_state.txt");
+        if (file.is_open()) {
+            std::string param;
+            while (file >> param) {
+                ParamRange* range = nullptr;
+                if (param == "threshold") range = &threshold;
+                else if (param == "filter_size") range = &filter_size;
+                else if (param == "edge_factor") range = &edge_factor;
+                else if (param == "quant_factor") range = &quant_factor;
+                else if (param == "entropy_weight") range = &entropy_weight;
+                else if (param == "texture_factor") range = &texture_factor;
+                else if (param == "freq_factor") range = &freq_factor;
+                else if (param == "local_entropy_factor") range = &local_entropy_factor;
+                else if (param == "noise_reduction") range = &noise_reduction;
+                else if (param == "contrast_boost") range = &contrast_boost;
+                else if (param == "detail_preservation") range = &detail_preservation;
+                if (range) {
+                    file >> range->min >> range->max >> range->influence;
+                    range->successful_values.clear();
+                    std::string line; std::getline(file, line);
+                    std::istringstream iss(line);
+                    float val;
+                    while (iss >> val) range->successful_values.push_back(val);
+                    range->center = (range->min + range->max) / 2;
+                }
+            }
+            file.close();
+        }
+    }
+};
+
+#endif
