@@ -1,0 +1,18 @@
+#include <iostream>
+using namespace std;
+
+
+int main () 
+{
+
+
+std::cout << "Введи число" << std::endl;
+int a = 0;
+std::cin >> a;
+std::cout << "Ты ввел " <<  a << std::endl;
+
+
+
+return 0;
+
+}
